@@ -1,0 +1,10 @@
+#ddev-generated
+#!/bin/bash
+
+## Description: Run the GitHub CLI (gh) in the web container
+## Usage: gh [flags]
+## Example: "ddev gh auth login\nddev gh pr list\nddev gh stack submit"
+
+set -eu
+
+gh "$@"

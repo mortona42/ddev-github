@@ -1,0 +1,666 @@
+#!/usr/bin/env bash
+#ddev-generated
+
+## Description: Configure how the GitHub CLI add-on stores its login
+## Usage: gh-setup [flags]
+## Example: "ddev gh-setup\nddev gh-setup --show\nddev gh-setup --dir=.ddev/gh\nddev gh-setup --copy-host\ngh auth token | ddev gh-setup --token-stdin"
+
+set -eu
+
+DEFAULT_REL=".ddev/gh"
+CONTAINER_ROOT="/var/www/html"
+
+# DDEV exports DDEV_APPROOT for host commands and for add-on install actions
+# alike. The fallback keeps the script runnable when it is invoked by path.
+APPROOT="${DDEV_APPROOT:-}"
+if [ -z "${APPROOT}" ]; then
+  APPROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+fi
+DDEV_DIR="${APPROOT}/.ddev"
+CONFIG_YAML="${DDEV_DIR}/config.gh.yaml"
+ENV_WEB="${DDEV_DIR}/.env.web"
+GLOBAL_CONFIG="${HOME}/.ddev/global_config.yaml"
+
+FROM_INSTALL=""
+RESTART_NEEDED=""
+
+#######################################
+# Terminal I/O
+#
+# `ddev add-on get` runs install actions with stdin and stdout on pipes, so the
+# dialog talks to /dev/tty directly instead. That is the only channel that
+# survives both `ddev gh-setup` and installation.
+#######################################
+
+TTY_OK=""
+tty_init() {
+  [ -n "${DDEV_NONINTERACTIVE:-}" ] && return 1
+  [ -e /dev/tty ] || return 1
+  { exec 3<>/dev/tty; } 2>/dev/null || return 1
+  TTY_OK=1
+  return 0
+}
+
+# Progress and prompts go to the terminal; results go to stdout so they are
+# still captured when the script runs unattended.
+say()  { if [ -n "${TTY_OK}" ]; then printf '%s\n' "$*" >&3; else printf '%s\n' "$*"; fi; }
+warn() { say "!! $*"; }
+
+# ask <prompt> <default> -> answer on stdout
+ask() {
+  local prompt="$1" default="${2:-}" answer=""
+  if [ -n "${default}" ]; then
+    printf '%s [%s]: ' "${prompt}" "${default}" >&3
+  else
+    printf '%s: ' "${prompt}" >&3
+  fi
+  IFS= read -r answer <&3 || answer=""
+  printf '%s\n' "${answer:-${default}}"
+}
+
+# ask_secret <prompt> -> answer on stdout, never echoed
+ask_secret() {
+  local prompt="$1" answer=""
+  printf '%s: ' "${prompt}" >&3
+  IFS= read -rs answer <&3 || answer=""
+  printf '\n' >&3
+  printf '%s\n' "${answer}"
+}
+
+# confirm <prompt> <y|n default> -> exit status
+confirm() {
+  local prompt="$1" default="${2:-y}" answer
+  answer="$(ask "${prompt} (y/n)" "${default}")"
+  case "${answer}" in [yY]*) return 0 ;; *) return 1 ;; esac
+}
+
+fail() { printf 'gh-setup: %s\n' "$*" >&2; exit 1; }
+
+#######################################
+# Reading the current state
+#######################################
+
+# The project-relative directory GH_CONFIG_DIR points at, or empty when the
+# add-on is not persisting gh's config into the project at all.
+current_rel() {
+  local line
+  [ -f "${CONFIG_YAML}" ] || return 0
+  line="$(grep -E '^[[:space:]]*-[[:space:]]*GH_CONFIG_DIR=' "${CONFIG_YAML}" | tail -n1 || true)"
+  [ -n "${line}" ] || return 0
+  line="${line#*GH_CONFIG_DIR=}"
+  line="${line%\"}"; line="${line#\"}"
+  printf '%s\n' "${line#"${CONTAINER_ROOT}"/}"
+}
+
+# gh takes its token from GH_TOKEN for github.com and from GH_ENTERPRISE_TOKEN
+# for a GitHub Enterprise Server host, so both are worth reporting.
+TOKEN_VARS="GH_TOKEN GH_ENTERPRISE_TOKEN"
+
+env_web_var() {
+  [ -f "${ENV_WEB}" ] || return 0
+  grep -E "^[[:space:]]*$1=" "${ENV_WEB}" | tail -n1 | sed "s/^[[:space:]]*$1=//" || true
+}
+
+global_has_var() {
+  [ -f "${GLOBAL_CONFIG}" ] && grep -qE "$1=" "${GLOBAL_CONFIG}"
+}
+
+# Is gh going to find a token in the environment, wherever it was set?
+any_token_configured() {
+  local v
+  for v in ${TOKEN_VARS}; do
+    [ -n "$(env_web_var "${v}")" ] && return 0
+    global_has_var "${v}" && return 0
+  done
+  return 1
+}
+
+# gh's config directory on the host, following the same rules gh itself uses.
+host_gh_dir() {
+  printf '%s\n' "${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/gh}"
+}
+
+mask() {
+  local v="$1"
+  if [ "${#v}" -gt 8 ]; then printf '%s...%s\n' "${v:0:4}" "${v: -4}"; else printf '****\n'; fi
+}
+
+#######################################
+# Writing the configuration
+#######################################
+
+# config.gh.yaml is regenerated rather than patched, so the comments always
+# describe the setting that is actually in the file.
+#
+# The #ddev-generated marker is kept only while the file still matches the
+# add-on default. Once it does not, dropping the marker is what stops a later
+# `ddev add-on get` from silently overwriting the choice made here.
+write_config_yaml() {
+  local rel="$1" tmp
+  tmp="$(mktemp "${DDEV_DIR}/.config.gh.yaml.XXXXXX")"
+  {
+    if [ "${rel}" = "${DEFAULT_REL}" ]; then
+      echo '#ddev-generated'
+    else
+      echo '# Written by `ddev gh-setup`.'
+      echo '#'
+      echo '# The #ddev-generated marker is deliberately absent: this file no longer holds'
+      echo '# the add-on default, so `ddev add-on get` will leave it alone instead of'
+      echo '# overwriting it. Re-run `ddev gh-setup` after updating the add-on to pick up'
+      echo '# changes to the rest of this file.'
+      echo '#'
+    fi
+    echo '# GitHub CLI in the web container.'
+    echo '#'
+    if [ -n "${rel}" ]; then
+      cat <<'EOF'
+# gh keeps its config and OAuth token in GH_CONFIG_DIR, which defaults to
+# ~/.config/gh -- a path inside the container that is wiped on every image
+# rebuild. Point it at the project instead, so a single `gh auth login` is
+# shared by everything in the container (interactive shells, scripts, coding
+# agents) and survives restarts and rebuilds.
+#
+EOF
+      echo "# ${rel}/.gitignore keeps the credentials out of git."
+      echo 'web_environment:'
+      echo "  - GH_CONFIG_DIR=${CONTAINER_ROOT}/${rel}"
+    else
+      cat <<'EOF'
+# gh's config and token are NOT stored in the project: GH_CONFIG_DIR is left at
+# the container default (~/.config/gh), which is wiped on every image rebuild.
+# Authentication comes from GH_TOKEN instead -- see .ddev/.env.web, or
+# `ddev config global --web-environment-add`.
+#
+# `ddev gh-setup` switches back to a stored login.
+#
+# web_environment is omitted rather than emptied: an empty list here would be
+# merged over the rest of the project's web_environment.
+EOF
+    fi
+    cat <<'EOF'
+
+hooks:
+  post-start:
+    # The gh-stack extension is baked into the web image, so a normal start has
+    # nothing to do. Reinstall only if it is genuinely missing -- for instance
+    # when the image build hit an unauthenticated GitHub API rate limit. Never
+    # fail the start over it; `ddev gh extension install github/gh-stack` is
+    # always available as a manual retry.
+    - exec: '[ -x "${XDG_DATA_HOME:-$HOME/.local/share}/gh/extensions/gh-stack/gh-stack" ] || gh extension install github/gh-stack || true'
+    # gh is useless until it is authenticated, and the login is interactive, so
+    # it cannot happen in a hook. Point at it instead of failing silently.
+    #
+    # Which advice is right depends on where the credential is meant to come
+    # from. `gh auth login` refuses to run at all while a token is set in the
+    # environment, so telling someone to run it then would send them in circles.
+    - exec: |
+        if ! gh auth status >/dev/null 2>&1; then
+          if [ -n "${GH_TOKEN:-}${GH_ENTERPRISE_TOKEN:-}" ]; then
+            echo "gh: the token in the environment is not valid -- expired, revoked, or missing scopes."
+            echo "gh: it overrides any stored login, so 'ddev gh auth login' cannot fix it. Run: ddev gh-setup"
+          elif [ -n "${GH_CONFIG_DIR:-}" ]; then
+            echo "gh: not authenticated -- run: ddev gh auth login"
+          else
+            echo "gh: not authenticated, and no login is being persisted -- run: ddev gh-setup"
+          fi
+        fi
+EOF
+  } > "${tmp}"
+  chmod 644 "${tmp}"
+  mv "${tmp}" "${CONFIG_YAML}"
+  RESTART_NEEDED=1
+}
+
+write_dir_gitignore() {
+  local dir="$1"
+  [ -e "${dir}/.gitignore" ] && return 0
+  cat > "${dir}/.gitignore" <<'EOF'
+# GitHub CLI credentials and config -- never commit.
+config.yml
+hosts.yml
+EOF
+}
+
+# Validate a user-supplied directory and normalise it to a path relative to the
+# project root. Only paths inside the project work: the project directory is the
+# only part of the host filesystem the web container can see.
+normalise_rel() {
+  local input="$1" rel
+  input="${input%/}"
+  [ -n "${input}" ] || fail "the directory cannot be empty"
+  case "${input}" in
+    "${APPROOT}"/*) rel="${input#"${APPROOT}"/}" ;;
+    /*) fail "${input} is outside the project; only paths under ${APPROOT} are mounted into the web container" ;;
+    ./*) rel="${input#./}" ;;
+    *) rel="${input}" ;;
+  esac
+  case "/${rel}/" in
+    */../*) fail "${input} must not contain '..'" ;;
+  esac
+  printf '%s\n' "${rel}"
+}
+
+apply_dir() {
+  local rel
+  rel="$(normalise_rel "$1")"
+  mkdir -p "${APPROOT}/${rel}"
+  write_dir_gitignore "${APPROOT}/${rel}"
+  write_config_yaml "${rel}"
+  say "gh will store its login in ${rel}/ (${CONTAINER_ROOT}/${rel} in the container)."
+  if [ "${rel}" != "${DEFAULT_REL}" ]; then
+    say "   .ddev/config.gh.yaml is now yours: \`ddev add-on get\` will not overwrite it."
+  fi
+}
+
+apply_no_dir() {
+  write_config_yaml ""
+  say "gh's config will not be stored in the project; authenticate with GH_TOKEN."
+}
+
+#######################################
+# Credentials
+#######################################
+
+copy_host_credentials() {
+  local rel="$1" scope="${2:-project}" src dest
+  src="$(host_gh_dir)"
+  dest="${APPROOT}/${rel}"
+
+  [ -n "${rel}" ] || fail "--copy-host needs a config directory; run with --dir first"
+  [ -d "${src}" ] || fail "no gh config found on the host at ${src}"
+  [ -f "${src}/hosts.yml" ] || fail "${src}/hosts.yml does not exist -- run 'gh auth login' on the host first"
+  if [ "$(cd "${src}" && pwd -P)" = "$(cd "${dest}" && pwd -P)" ]; then
+    say "Host and project config directories are the same path; nothing to copy."
+    return 0
+  fi
+
+  mkdir -p "${dest}"
+  cp "${src}/hosts.yml" "${dest}/hosts.yml"
+  chmod 600 "${dest}/hosts.yml"
+  say "Copied ${src}/hosts.yml -> ${rel}/hosts.yml"
+
+  if [ -f "${src}/config.yml" ] && [ ! -f "${dest}/config.yml" ]; then
+    cp "${src}/config.yml" "${dest}/config.yml"
+    say "Copied ${src}/config.yml -> ${rel}/config.yml"
+  fi
+
+  # gh can keep the token in the OS keyring instead of hosts.yml (secure
+  # storage). Copying the file then yields a login with no credential in it,
+  # which fails in the container in a thoroughly confusing way. Asking the
+  # host's own gh for the token is the only way back out of the keyring.
+  if ! grep -q 'oauth_token:' "${dest}/hosts.yml"; then
+    warn "${rel}/hosts.yml has no oauth_token: the host keeps its token in the OS keyring."
+    if [ -n "${TTY_OK}" ]; then
+      say "   It can be read out with 'gh auth token', but it then lives in a plain file"
+      say "   in the project rather than in the keyring."
+      if ! confirm "   Do that now?" "y"; then
+        say "   Later:  gh auth token | ddev gh-setup --token-stdin"
+        return 1
+      fi
+    fi
+    recover_keyring_token "${dest}" "${scope}" || return 1
+  fi
+}
+
+# gh reads GH_TOKEN for github.com and GH_ENTERPRISE_TOKEN for a GitHub
+# Enterprise Server host, so which variable to set depends on the hostname.
+token_var_for_host() {
+  case "$1" in
+    github.com) printf 'GH_TOKEN\n' ;;
+    *) printf 'GH_ENTERPRISE_TOKEN\n' ;;
+  esac
+}
+
+# The hostnames a hosts.yml has entries for: its top-level keys.
+hosts_in() {
+  [ -f "$1" ] || return 0
+  sed -n 's/^\([A-Za-z0-9][A-Za-z0-9._-]*\):[[:space:]]*$/\1/p' "$1"
+}
+
+# Ask the host's gh for each host's token and carry it into the container as an
+# environment variable. This is the keyring fallback for --copy-host, and does
+# what `gh auth token | ddev gh-setup --token-stdin` does by hand.
+recover_keyring_token() {
+  local dest="$1" scope="${2:-project}" host var token recovered="" used=""
+
+  if ! command -v gh >/dev/null 2>&1; then
+    warn "gh is not installed on the host, so its keyring cannot be read."
+    warn "Run this where gh is installed:  gh auth token | ddev gh-setup --token-stdin"
+    return 1
+  fi
+  say "   Reading it out of the keyring with 'gh auth token'."
+
+  for host in $(hosts_in "${dest}/hosts.yml"); do
+    var="$(token_var_for_host "${host}")"
+
+    # Only one token per variable can travel in the environment, so a second
+    # enterprise host has nowhere to go. Say which one was dropped.
+    case " ${used} " in
+      *" ${var} "*)
+        warn "${host}: gh has only one ${var}, already used; its token was not carried over."
+        continue
+        ;;
+    esac
+
+    # gh must read the keyring entry for the *host's* config, not the project's.
+    if ! token="$(GH_CONFIG_DIR="$(host_gh_dir)" gh auth token --hostname "${host}" 2>/dev/null)" \
+      || [ -z "${token}" ]; then
+      warn "${host}: 'gh auth token' returned nothing (not logged in, or the keyring is locked)."
+      continue
+    fi
+
+    if [ "${scope}" = "global" ]; then
+      set_global_token "${var}" "${token}"
+    else
+      set_project_token "${var}" "${token}"
+    fi
+    used="${used} ${var}"
+    recovered=1
+  done
+
+  if [ -z "${recovered}" ]; then
+    warn "No token could be read out of the host's keyring."
+    return 1
+  fi
+}
+
+# set_project_token [VAR] <token> -- VAR defaults to GH_TOKEN.
+set_project_token() {
+  local var token tmp
+  if [ $# -gt 1 ]; then var="$1"; token="$2"; else var="GH_TOKEN"; token="$1"; fi
+  [ -n "${token}" ] || fail "empty token"
+  tmp="$(mktemp)"
+  if [ -f "${ENV_WEB}" ]; then
+    grep -vE "^[[:space:]]*${var}=" "${ENV_WEB}" > "${tmp}" || true
+  fi
+  printf '%s=%s\n' "${var}" "${token}" >> "${tmp}"
+  install -m 600 "${tmp}" "${ENV_WEB}"
+  rm -f "${tmp}"
+  say "Wrote ${var} to .ddev/.env.web (mode 600)."
+  if ensure_gitignored '.ddev/.env.web'; then
+    say "Added .ddev/.env.web to .gitignore."
+  fi
+  RESTART_NEEDED=1
+}
+
+# set_global_token [VAR] <token> -- VAR defaults to GH_TOKEN.
+set_global_token() {
+  local var token
+  if [ $# -gt 1 ]; then var="$1"; token="$2"; else var="GH_TOKEN"; token="$1"; fi
+  [ -n "${token}" ] || fail "empty token"
+  ddev config global --web-environment-add="${var}=${token}" >/dev/null
+  say "Wrote ${var} to DDEV's global config: every project on this machine gets it."
+  RESTART_NEEDED=1
+}
+
+# .ddev/.gitignore is generated by DDEV and does not cover .env.web, so the
+# project's own .gitignore has to. Returns non-zero when the pattern was already
+# there and nothing was written.
+ensure_gitignored() {
+  local pattern="$1" file="${APPROOT}/.gitignore"
+  if [ -f "${file}" ] && grep -qxF "${pattern}" "${file}"; then
+    return 1
+  fi
+  # Do not glue the pattern onto an unterminated last line.
+  if [ -s "${file}" ] && [ -n "$(tail -c1 "${file}")" ]; then
+    printf '\n' >> "${file}"
+  fi
+  printf '%s\n' "${pattern}" >> "${file}"
+}
+
+#######################################
+# --show
+#######################################
+
+show_state() {
+  local rel hosts_yml v val found=""
+  rel="$(current_rel)"
+
+  row() { printf '  %-15s %s\n' "$1" "$2"; }
+
+  echo "GitHub CLI add-on configuration"
+  row "project:" "${DDEV_PROJECT:-$(basename "${APPROOT}")} (${APPROOT})"
+
+  if [ -n "${rel}" ]; then
+    row "config dir:" "${rel}  ->  ${CONTAINER_ROOT}/${rel}"
+    hosts_yml="${APPROOT}/${rel}/hosts.yml"
+    if [ ! -f "${hosts_yml}" ]; then
+      row "stored login:" "none -- run 'ddev gh auth login'"
+    elif grep -q 'oauth_token:' "${hosts_yml}"; then
+      row "stored login:" "yes (${rel}/hosts.yml)"
+    elif any_token_configured; then
+      row "stored login:" "${rel}/hosts.yml, token supplied from the environment"
+    else
+      row "stored login:" "${rel}/hosts.yml holds no oauth_token and no token is set"
+    fi
+    if [ -f "${APPROOT}/${rel}/.gitignore" ]; then
+      row "gitignored:" "yes (${rel}/.gitignore)"
+    else
+      row "gitignored:" "NO -- ${rel}/.gitignore is missing"
+    fi
+  else
+    row "config dir:" "not persisted (container default, wiped on rebuild)"
+  fi
+
+  for v in ${TOKEN_VARS}; do
+    val="$(env_web_var "${v}")"
+    if [ -n "${val}" ]; then
+      row "${v}:" "set in .ddev/.env.web ($(mask "${val}"))"
+      found=1
+    elif global_has_var "${v}"; then
+      row "${v}:" "set in DDEV's global config (all projects)"
+      found=1
+    fi
+  done
+  [ -n "${found}" ] || row "GH_TOKEN:" "not set"
+
+  if [ -f "$(host_gh_dir)/hosts.yml" ]; then
+    if grep -q 'oauth_token:' "$(host_gh_dir)/hosts.yml"; then
+      row "host gh login:" "available at $(host_gh_dir)/hosts.yml"
+    else
+      row "host gh login:" "$(host_gh_dir), token in the OS keyring"
+    fi
+  else
+    row "host gh login:" "none at $(host_gh_dir)"
+  fi
+
+  row "add-on updates:" "$(head -n1 "${CONFIG_YAML}" 2>/dev/null | grep -q '#ddev-generated' && echo 'config.gh.yaml is add-on managed' || echo 'config.gh.yaml is yours; add-on updates skip it')"
+}
+
+#######################################
+# The dialog
+#######################################
+
+interactive() {
+  local rel choice want new_rel token
+
+  rel="$(current_rel)"
+  say ""
+  say "GitHub CLI add-on -- authentication setup"
+  say "========================================"
+  say ""
+  if [ -n "${rel}" ]; then
+    say "Right now gh stores its config and login in ${rel}/."
+  else
+    say "Right now gh's config is not stored in the project."
+  fi
+  say ""
+  say "Where should the login live?"
+  say "  1) ${DEFAULT_REL}  -- in the project, shared by everything in the container (default)"
+  say "  2) another directory in the project"
+  say "  3) nowhere -- authenticate with a GH_TOKEN environment variable instead"
+  say ""
+  choice="$(ask "Choose 1-3" "1")"
+
+  case "${choice}" in
+    1) apply_dir "${DEFAULT_REL}"; rel="${DEFAULT_REL}" ;;
+    2)
+      new_rel="$(ask "Directory, relative to the project root" "${rel:-${DEFAULT_REL}}")"
+      apply_dir "${new_rel}"
+      rel="$(normalise_rel "${new_rel}")"
+      ;;
+    3) apply_no_dir; rel="" ;;
+    *) fail "'${choice}' is not one of 1, 2 or 3" ;;
+  esac
+
+  say ""
+  if [ -n "${rel}" ]; then
+    say "How should gh get a login?"
+    local n=1 opt_copy="" opt_login="" opt_token=""
+    if [ -f "$(host_gh_dir)/hosts.yml" ]; then
+      opt_copy="${n}"; say "  ${n}) copy the login you already have on the host ($(host_gh_dir))"; n=$((n + 1))
+    fi
+    opt_login="${n}"; say "  ${n}) authenticate through DDEV, interactively (ddev gh auth login)"; n=$((n + 1))
+    opt_token="${n}"; say "  ${n}) paste a personal access token now"; n=$((n + 1))
+    say "  ${n}) leave it for later"
+    say ""
+    want="$(ask "Choose 1-${n}" "${opt_copy:-${opt_login}}")"
+
+    if [ -n "${opt_copy}" ] && [ "${want}" = "${opt_copy}" ]; then
+      copy_host_credentials "${rel}" || true
+    elif [ "${want}" = "${opt_login}" ]; then
+      offer_login
+    elif [ "${want}" = "${opt_token}" ]; then
+      token="$(ask_secret "Personal access token (input hidden)")"
+      [ -n "${token}" ] || fail "no token entered"
+      set_project_token "${token}"
+    fi
+  else
+    say "Where should GH_TOKEN be set?"
+    say "  1) this project only (.ddev/.env.web)"
+    say "  2) every DDEV project on this machine (ddev config global)"
+    say "  3) nowhere -- I will set it myself"
+    say ""
+    want="$(ask "Choose 1-3" "1")"
+    case "${want}" in
+      1) token="$(ask_secret "Personal access token (input hidden)")"; set_project_token "${token}" ;;
+      2) token="$(ask_secret "Personal access token (input hidden)")"; set_global_token "${token}" ;;
+      *) : ;;
+    esac
+  fi
+
+  say ""
+  finish
+}
+
+# `ddev gh auth login` needs the container running with the configuration this
+# script just wrote. During `ddev add-on get` a nested ddev restart is a bad
+# idea, so there the commands are only printed.
+offer_login() {
+  if [ -n "${FROM_INSTALL}" ]; then
+    say "Run this once the add-on is enabled:"
+    say "   ddev restart && ddev gh auth login"
+    return 0
+  fi
+  if confirm "Restart the project and run 'ddev gh auth login' now?" "y"; then
+    say ""
+    ddev restart >&3 2>&3
+    RESTART_NEEDED=""
+    ddev gh auth login <&3 >&3 2>&3 || warn "gh auth login did not complete."
+  else
+    say "Run it when you are ready:  ddev restart && ddev gh auth login"
+  fi
+}
+
+finish() {
+  say "Current state:"
+  show_state | while IFS= read -r l; do say "   ${l}"; done
+  if [ -n "${RESTART_NEEDED}" ]; then
+    say ""
+    if [ -n "${FROM_INSTALL}" ]; then
+      say "Run 'ddev restart' to enable the add-on and apply this."
+    else
+      say "Run 'ddev restart' to apply this."
+    fi
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ddev gh-setup [flags]
+
+With no flags, asks how the GitHub CLI add-on should authenticate.
+
+  --show            print the current configuration and exit
+  --dir=DIR         store gh's config in DIR (relative to the project root)
+  --no-dir          do not store gh's config in the project; use GH_TOKEN
+  --copy-host       copy the host's gh login into the configured directory; if
+                    the host keeps its token in the OS keyring, read it out with
+                    `gh auth token` and carry it in the environment instead
+  --token-stdin     read a personal access token from stdin
+  --global          with --token-stdin or --copy-host, set the token for every
+                    project on this machine rather than just this one
+  --from-install    invoked by the add-on installer; do not run nested ddev commands
+  -h, --help        this message
+EOF
+}
+
+#######################################
+# Entry point
+#######################################
+
+main() {
+  local do_show="" want_dir="" no_dir="" copy_host="" token_stdin="" global="" acted=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --show) do_show=1 ;;
+      --dir) shift; want_dir="${1:-}" ;;
+      --dir=*) want_dir="${1#--dir=}" ;;
+      --no-dir) no_dir=1 ;;
+      --copy-host) copy_host=1 ;;
+      --token-stdin) token_stdin=1 ;;
+      --global) global=1 ;;
+      --from-install) FROM_INSTALL=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; fail "unknown flag '$1'" ;;
+    esac
+    shift
+  done
+
+  [ -d "${DDEV_DIR}" ] || fail "no .ddev directory at ${APPROOT}"
+
+  if [ -n "${do_show}" ]; then
+    show_state
+    exit 0
+  fi
+
+  [ -n "${want_dir}" ] && [ -n "${no_dir}" ] && fail "--dir and --no-dir are mutually exclusive"
+
+  if [ -n "${no_dir}" ]; then apply_no_dir; acted=1; fi
+  if [ -n "${want_dir}" ]; then apply_dir "${want_dir}"; acted=1; fi
+  local scope="project"
+  [ -n "${global}" ] && scope="global"
+
+  if [ -n "${copy_host}" ]; then copy_host_credentials "$(current_rel)" "${scope}" || true; acted=1; fi
+  if [ -n "${token_stdin}" ]; then
+    local token
+    IFS= read -r token || true
+    if [ "${scope}" = "global" ]; then set_global_token "${token}"; else set_project_token "${token}"; fi
+    acted=1
+  fi
+
+  # Flags are the non-interactive contract: everything stays on stdout, and the
+  # keyring fallback runs without asking rather than prompting a script.
+  if [ -n "${acted}" ]; then
+    finish
+    exit 0
+  fi
+
+  if tty_init; then
+    interactive
+    exit 0
+  fi
+
+  # No terminal to talk to -- an unattended install, or DDEV_NONINTERACTIVE.
+  # Change nothing, report what is in place, and say where the dialog lives.
+  echo "gh add-on: no terminal for the setup dialog; keeping the current configuration."
+  echo ""
+  show_state
+  echo ""
+  echo "Run 'ddev gh-setup' to store the login elsewhere, copy it from the host, or"
+  echo "use a GH_TOKEN instead."
+  exit 0
+}
+
+main "$@"

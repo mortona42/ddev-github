@@ -1,0 +1,4 @@
+#ddev-generated
+# GitHub CLI credentials and config -- never commit.
+config.yml
+hosts.yml

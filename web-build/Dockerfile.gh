@@ -1,0 +1,28 @@
+#ddev-generated
+
+# Install the GitHub CLI from GitHub's own apt repo.
+#
+# `webimage_extra_packages: [gh]` would install Debian's package instead, which
+# trixie froze at 2.46.0 and never bumps. This tracks upstream releases.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    > /etc/apt/sources.list.d/github-cli.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends gh \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install the stacked-PR extension (`gh stack`) for the container user.
+#
+# Extensions live in the user's data dir (~/.local/share/gh/extensions), not in
+# GH_CONFIG_DIR, so this stays in the image and out of the project directory.
+# The image build runs as root and sudo's env_reset keeps root's HOME, which
+# would install the extension for the wrong user -- hence -H.
+#
+# The download is an unauthenticated GitHub API call, so a shared-IP rate limit
+# can fail it. That must not sink the whole image build -- the add-on's
+# post-start hook retries when the extension is missing.
+RUN sudo -u ${username} -H gh extension install github/gh-stack \
+  || echo "gh: could not install the gh-stack extension during build; the post-start hook will retry"

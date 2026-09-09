@@ -1,0 +1,38 @@
+#ddev-generated
+# GitHub CLI in the web container.
+#
+# gh keeps its config and OAuth token in GH_CONFIG_DIR, which defaults to
+# ~/.config/gh -- a path inside the container that is wiped on every image
+# rebuild. Point it at the project instead, so a single `gh auth login` is
+# shared by everything in the container (interactive shells, scripts, coding
+# agents) and survives restarts and rebuilds.
+#
+# .ddev/gh/.gitignore keeps the credentials out of git.
+web_environment:
+  - GH_CONFIG_DIR=/var/www/html/.ddev/gh
+
+hooks:
+  post-start:
+    # The gh-stack extension is baked into the web image, so a normal start has
+    # nothing to do. Reinstall only if it is genuinely missing -- for instance
+    # when the image build hit an unauthenticated GitHub API rate limit. Never
+    # fail the start over it; `ddev gh extension install github/gh-stack` is
+    # always available as a manual retry.
+    - exec: '[ -x "${XDG_DATA_HOME:-$HOME/.local/share}/gh/extensions/gh-stack/gh-stack" ] || gh extension install github/gh-stack || true'
+    # gh is useless until it is authenticated, and the login is interactive, so
+    # it cannot happen in a hook. Point at it instead of failing silently.
+    #
+    # Which advice is right depends on where the credential is meant to come
+    # from. `gh auth login` refuses to run at all while a token is set in the
+    # environment, so telling someone to run it then would send them in circles.
+    - exec: |
+        if ! gh auth status >/dev/null 2>&1; then
+          if [ -n "${GH_TOKEN:-}${GH_ENTERPRISE_TOKEN:-}" ]; then
+            echo "gh: the token in the environment is not valid -- expired, revoked, or missing scopes."
+            echo "gh: it overrides any stored login, so 'ddev gh auth login' cannot fix it. Run: ddev gh-setup"
+          elif [ -n "${GH_CONFIG_DIR:-}" ]; then
+            echo "gh: not authenticated -- run: ddev gh auth login"
+          else
+            echo "gh: not authenticated, and no login is being persisted -- run: ddev gh-setup"
+          fi
+        fi
