@@ -21,7 +21,7 @@ setup() {
   [ "${RUNNER_DEBUG:-}" = "1" ] && export BATS_VERBOSE_RUN=1
 
   # Override this variable for your add-on:
-  export GITHUB_REPO=mortona42/ddev-gh
+  export GITHUB_REPO=mortona42/ddev-github
 
   TEST_BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
   export BATS_LIB_PATH="${BATS_LIB_PATH:-}:${TEST_BREW_PREFIX}/lib:/usr/lib/bats:/usr/local/lib/bats"

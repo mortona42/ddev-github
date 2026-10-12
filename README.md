@@ -1,6 +1,6 @@
 # ddev-github <!-- omit in toc -->
 
-[![tests](https://github.com/mortona42/ddev-gh/actions/workflows/tests.yml/badge.svg)](https://github.com/mortona42/ddev-gh/actions/workflows/tests.yml)
+[![tests](https://github.com/mortona42/ddev-github/actions/workflows/tests.yml/badge.svg)](https://github.com/mortona42/ddev-github/actions/workflows/tests.yml)
 
 Installs the [GitHub CLI](https://cli.github.com/) and the
 [`gh stack`](https://github.com/github/gh-stack) stacked-pull-request extension
