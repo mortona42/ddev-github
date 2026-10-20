@@ -237,6 +237,22 @@ EOF
   run ddev exec gh stack --version
   assert_success
   assert_output --partial "gh stack version"
+
+  # A download that fails mid-install leaves the directory without its binary.
+  # gh still sees the extension, so `gh extension install` refuses with "already
+  # installed" -- the hook has to clear the remains before reinstalling.
+  run ddev exec "rm -f ${GH_STACK_DIR}/gh-stack"
+  assert_success
+  run ddev exec gh stack --version
+  assert_failure
+  assert_output --partial "no such file or directory"
+
+  run ddev restart -y
+  assert_success
+  refute_hook_failure
+  run ddev exec gh stack --version
+  assert_success
+  assert_output --partial "gh stack version"
 }
 
 # `ddev gh-setup` regenerates config.gh.yaml rather than patching it, so the file
